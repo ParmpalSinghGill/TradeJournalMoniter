@@ -1,0 +1,36 @@
+# Environment configuration & secrets
+.env
+.env.*
+!.env.example
+fyers_token.txt
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Logs & temporary files
+*.log
+scratch/
+test_*.py
+
+# Intermediate backup scripts
+generate_journal - Copy*.py
+trade_journal
