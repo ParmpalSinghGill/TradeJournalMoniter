@@ -445,8 +445,10 @@ def calculate_fyers_charges(symbol, side, qty, price, product_type):
     Calculate estimated Fyers transaction charges and taxes.
     Includes: Brokerage, STT, Exchange Transaction Charges (ETC), SEBI turnover fee, GST, and Stamp Duty.
     """
-    trade_value = qty * price
+    multiplier = get_fyers_symbol_multiplier(symbol)
+    trade_value = qty * price * multiplier
     sym_name = symbol.split(":")[-1] if ":" in symbol else symbol
+    is_mcx = symbol.upper().startswith("MCX:")
     
     # Check if Options (symbols ending in CE/PE)
     is_option = sym_name.endswith("CE") or sym_name.endswith("PE")
@@ -455,23 +457,25 @@ def calculate_fyers_charges(symbol, side, qty, price, product_type):
         # F&O Options charges matching Fyers platform exactly
         brokerage = 20.0
         
-        # 1. Transaction (Exchange + clearing): 0.04353%
-        etc = 0.0004353 * trade_value
+        if is_mcx:
+            # MCX Options: ETC = 0.05%, STT = 0.0625% on SELL
+            etc = 0.0005 * trade_value
+            stt = 0.000625 * trade_value if side == "SELL" else 0.0
+            ipft = 0.0
+        else:
+            # NSE Options: ETC = 0.04353%, STT = 0.1% on SELL (option premium)
+            etc = 0.0004353 * trade_value
+            stt = 0.001 * trade_value if side == "SELL" else 0.0
+            ipft = 0.000005 * trade_value # NSE IPFT: Rs 50 per crore
         
-        # 2. SEBI Fee: Rs 10 per crore (0.0001%)
+        # SEBI Fee: Rs 10 per crore (0.0001%)
         sebi = 0.000001 * trade_value
         
-        # 3. GST: 18% on (Brokerage + ETC + SEBI)
+        # GST: 18% on (Brokerage + ETC + SEBI)
         gst = 0.18 * (brokerage + etc + sebi)
         
-        # 4. Stamp Duty: 0.003% on BUY side
+        # Stamp Duty: 0.003% on BUY side
         stamp = 0.00003 * trade_value if side == "BUY" else 0.0
-        
-        # 5. NSE IPFT: Rs 50 per crore (0.0005%)
-        ipft = 0.000005 * trade_value
-        
-        # 6. STT: 0.15% on SELL side
-        stt = 0.0015 * trade_value if side == "SELL" else 0.0
         
         total = brokerage + etc + sebi + gst + stamp + ipft + stt
         return total
@@ -894,60 +898,92 @@ def main():
         "Learning", "Number of fail on same setup before work"
     ]
     target_date_str = target_date.strftime("%Y-%m-%d")
-    last_index = 0
 
-    print(f"\nWriting {len(compiled_trades)} trades to '{csv_file}'...")
+    # Read existing rows from CSV if present to preserve past days and manual notes
+    existing_other_rows = []
+    existing_manual_notes = {}
+    if os.path.exists(csv_file):
+        try:
+            with open(csv_file, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                file_headers = next(reader, None)
+                for row in reader:
+                    if not row or len(row) < 1:
+                        continue
+                    row_date = row[0]
+                    if row_date != target_date_str:
+                        existing_other_rows.append(row)
+                    else:
+                        ticker = row[2] if len(row) > 2 else ""
+                        time_str = row[3] if len(row) > 3 else ""
+                        notes = row[13:] if len(row) > 13 else []
+                        existing_manual_notes[(ticker, time_str)] = notes
+        except Exception as e:
+            print(f"[CSV Warning] Could not read existing '{csv_file}': {e}")
+
+    new_target_rows = []
+    for i, t in enumerate(compiled_trades, start=1):
+        trade_idx = i
+        entry_time_str = t["entry_time"].strftime("%H:%M:%S")
+        exit_1_str = t["exit_time_1"].strftime("%H:%M:%S") if isinstance(t["exit_time_1"], datetime) else str(t["exit_time_1"])
+        exit_2_str = t["exit_time_2"].strftime("%H:%M:%S") if isinstance(t["exit_time_2"], datetime) else str(t["exit_time_2"])
+        
+        pl = f"{t['pl']:.2f}" if isinstance(t["pl"], float) else str(t["pl"])
+        if isinstance(t["pl"], (int, float)) and isinstance(t["fee"], (int, float)):
+            pl_after = f"{(t['pl'] - t['fee']):.2f}"
+        else:
+            pl_after = ""
+            
+        pl_1 = f"{t['pl_1']:.2f}" if isinstance(t["pl_1"], float) else str(t["pl_1"])
+        pl_2 = f"{t['pl_2']:.2f}" if isinstance(t["pl_2"], float) else str(t["pl_2"])
+        fee = f"{t['fee']:.4f}" if isinstance(t["fee"], float) else str(t["fee"])
+        
+        saved_notes = existing_manual_notes.get((t["ticker"], entry_time_str), [])
+        trend = saved_notes[0] if len(saved_notes) > 0 else ""
+        liquidity = saved_notes[1] if len(saved_notes) > 1 else ""
+        first_candle = saved_notes[2] if len(saved_notes) > 2 else ""
+        setup_exp = saved_notes[3] if len(saved_notes) > 3 else ""
+        is_works = saved_notes[4] if len(saved_notes) > 4 else ""
+        can_improved = saved_notes[5] if len(saved_notes) > 5 else ""
+        learning = saved_notes[6] if len(saved_notes) > 6 else ""
+        num_fail = saved_notes[7] if len(saved_notes) > 7 else ""
+        
+        row = [
+            target_date_str,                  # Date
+            trade_idx,                        # Trade Index
+            t["ticker"],                      # Ticker
+            entry_time_str,                   # Time
+            exit_1_str,                       # Exit Time 1
+            exit_2_str,                       # Exit Time 2
+            t["side"],                        # Side
+            "",                               # PL Results (Empty)
+            pl_after,                         # P/L after Charges
+            pl,                               # P/L
+            pl_1,                             # P/L 1
+            pl_2,                             # P/L 2
+            fee,                              # Brokrage
+            trend,                            # Trend
+            liquidity,                        # Liqudity type
+            first_candle,                     # First candle type
+            setup_exp,                        # Setup explanation
+            is_works,                         # Is trade works
+            can_improved,                     # Can this be improved
+            learning,                         # Learning
+            num_fail                          # Number of fail...
+        ]
+        new_target_rows.append(row)
+
+    all_final_rows = existing_other_rows + new_target_rows
+    all_final_rows.sort(key=lambda r: (r[0], int(r[1]) if r[1].isdigit() else 0))
+
+    print(f"\nWriting {len(compiled_trades)} trades for {target_date_str} to '{csv_file}' (preserving previous dates)...")
     
     try:
         with open(csv_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(headers)
-            
-            for i, t in enumerate(compiled_trades, start=1):
-                trade_idx = last_index + i
-                
-                # Formatting times
-                entry_time_str = t["entry_time"].strftime("%H:%M:%S")
-                exit_1_str = t["exit_time_1"].strftime("%H:%M:%S") if isinstance(t["exit_time_1"], datetime) else str(t["exit_time_1"])
-                exit_2_str = t["exit_time_2"].strftime("%H:%M:%S") if isinstance(t["exit_time_2"], datetime) else str(t["exit_time_2"])
-                
-                # Format P/Ls (2 decimal places if float)
-                pl = f"{t['pl']:.2f}" if isinstance(t["pl"], float) else str(t["pl"])
-                
-                # P/L after Charges (P/L - Fee)
-                if isinstance(t["pl"], (int, float)) and isinstance(t["fee"], (int, float)):
-                    pl_after = f"{(t['pl'] - t['fee']):.2f}"
-                else:
-                    pl_after = ""
-                    
-                pl_1 = f"{t['pl_1']:.2f}" if isinstance(t["pl_1"], float) else str(t["pl_1"])
-                pl_2 = f"{t['pl_2']:.2f}" if isinstance(t["pl_2"], float) else str(t["pl_2"])
-                fee = f"{t['fee']:.4f}" if isinstance(t["fee"], float) else str(t["fee"])
-                
-                row = [
-                    target_date_str,                  # Date
-                    trade_idx,                        # Trade Index
-                    t["ticker"],                      # Ticker
-                    entry_time_str,                   # Time
-                    exit_1_str,                       # Exit Time 1
-                    exit_2_str,                       # Exit Time 2
-                    t["side"],                        # Side
-                    "",                               # PL Results (Empty)
-                    pl_after,                         # P/L after Charges
-                    pl,                               # P/L
-                    pl_1,                             # P/L 1
-                    pl_2,                             # P/L 2
-                    fee,                              # Brokrage
-                    "",                               # Trend (Empty)
-                    "",                               # Liqudity type (Empty)
-                    "",                               # First candle type (Empty)
-                    "",                               # Setup explanation (Empty)
-                    "",                               # Is trade works (Empty)
-                    "",                               # Can this be improved (Empty)
-                    "",                               # Learning (Empty)
-                    ""                                # Number of fail... (Empty)
-                ]
-                writer.writerow(row)
+            for r in all_final_rows:
+                writer.writerow(r)
         print("Done! CSV file updated successfully.")
     except PermissionError:
         print(f"\n[ERROR] Permission Denied: Could not write to '{csv_file}'. Please make sure it is closed and not open in Excel, then run again.")
