@@ -973,8 +973,18 @@ def main():
         ]
         new_target_rows.append(row)
 
+    def parse_sort_key(r):
+        date_str = str(r[0]) if len(r) > 0 else ""
+        idx_val = 0
+        if len(r) > 1:
+            try:
+                idx_val = int(r[1])
+            except Exception:
+                idx_val = 0
+        return (date_str, idx_val)
+
     all_final_rows = existing_other_rows + new_target_rows
-    all_final_rows.sort(key=lambda r: (r[0], int(r[1]) if r[1].isdigit() else 0))
+    all_final_rows.sort(key=parse_sort_key)
 
     print(f"\nWriting {len(compiled_trades)} trades for {target_date_str} to '{csv_file}' (preserving previous dates)...")
     
