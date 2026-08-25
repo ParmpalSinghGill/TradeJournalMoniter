@@ -5,7 +5,17 @@ import time
 import hmac
 import hashlib
 
-def load_env(filepath=".env"):
+def load_env(filepath=None):
+    if filepath is None or filepath == ".env":
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        root_dir = os.path.dirname(script_dir)
+        if os.path.exists(os.path.join(script_dir, ".env")):
+            filepath = os.path.join(script_dir, ".env")
+        elif os.path.exists(os.path.join(root_dir, ".env")):
+            filepath = os.path.join(root_dir, ".env")
+        else:
+            filepath = ".env"
+            
     config = {}
     if os.path.exists(filepath):
         with open(filepath, "r") as f:

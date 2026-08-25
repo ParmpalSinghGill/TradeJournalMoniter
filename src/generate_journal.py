@@ -12,8 +12,18 @@ import urllib.parse as urlparse
 
 # --- Helper Functions ---
 
-def load_env(filepath=".env"):
+def load_env(filepath=None):
     """Load configuration variables from a .env file."""
+    if filepath is None or filepath == ".env":
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        root_dir = os.path.dirname(script_dir)
+        if os.path.exists(os.path.join(script_dir, ".env")):
+            filepath = os.path.join(script_dir, ".env")
+        elif os.path.exists(os.path.join(root_dir, ".env")):
+            filepath = os.path.join(root_dir, ".env")
+        else:
+            filepath = ".env"
+            
     config = {}
     if os.path.exists(filepath):
         with open(filepath, "r") as f:
@@ -344,7 +354,7 @@ def exchange_and_save_token(app_id, secret_id, auth_code, redirect_uri):
                 res_data = res.json()
                 access_token = res_data.get("access_token")
                 if access_token:
-                    with open("fyers_token.txt", "w") as f:
+                    with open(get_token_file_path(), "w") as f:
                         f.write(access_token)
                     print("[Fyers] Authentication successful! Access token saved.")
                     return True
@@ -359,9 +369,20 @@ def exchange_and_save_token(app_id, secret_id, auth_code, redirect_uri):
 
 
 
+def get_token_file_path():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.dirname(script_dir)
+    src_token = os.path.join(script_dir, "fyers_token.txt")
+    root_token = os.path.join(root_dir, "fyers_token.txt")
+    if os.path.exists(src_token):
+        return src_token
+    elif os.path.exists(root_token):
+        return root_token
+    return src_token
+
 def get_fyers_token(app_id, secret_id):
     """Retrieve or generate Fyers access token, running a local redirect server if needed."""
-    token_file = "fyers_token.txt"
+    token_file = get_token_file_path()
     config = load_env()
     
     # 1. Try reading cached token

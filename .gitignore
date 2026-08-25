@@ -25,6 +25,8 @@ ENV/
 # OS generated files
 .DS_Store
 Thumbs.db
+.~lock.*
+.~lock.*#
 
 # Logs & temporary files
 *.log
