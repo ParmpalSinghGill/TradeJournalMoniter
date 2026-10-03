@@ -2,12 +2,16 @@ import os
 import sys
 import csv
 import time
+import threading
 import json
 import hmac
 import hashlib
 import requests
 from datetime import datetime, date
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import select
+if sys.platform == "win32":
+    import msvcrt
 import urllib.parse as urlparse
 
 # --- Helper Functions ---
@@ -95,7 +99,7 @@ def get_usdt_inr_rate():
     return 100.22 # Fallback to today's verified rate
 
 def fetch_coindcx_trades(api_key, api_secret, target_date):
-    """Fetch private trade history from CoinDCX (both Spot and Futures) and filter by target date."""
+    """Fetch private trade history from CoinDCX (both Spot and Futures) up to target_date."""
     if not api_key or not api_secret:
         print("[CoinDCX] API Key or Secret missing. Skipping CoinDCX.")
         return []
@@ -106,6 +110,7 @@ def fetch_coindcx_trades(api_key, api_secret, target_date):
     
     timestamp_ms = int(time.time() * 1000)
     filtered = []
+    cutoff_dt = datetime.combine(target_date, datetime.max.time())
     
     # 1. Fetch Spot Trades
     spot_url = "https://api.coindcx.com/exchange/v1/orders/trade_history"
@@ -131,7 +136,7 @@ def fetch_coindcx_trades(api_key, api_secret, target_date):
                     if not ts:
                         continue
                     trade_dt = datetime.fromtimestamp(ts / 1000.0)
-                    if trade_dt.date() == target_date:
+                    if trade_dt <= cutoff_dt:
                         symbol = t.get("symbol", "")
                         # Convert to INR if it is a USDT trading pair
                         is_usdt = symbol.endswith("_USDT") or symbol.endswith("USDT")
@@ -148,7 +153,7 @@ def fetch_coindcx_trades(api_key, api_secret, target_date):
                         })
                         spot_filtered_count += 1
                 if spot_filtered_count > 0:
-                    print(f"[CoinDCX] Found {spot_filtered_count} Spot trades matching date {target_date}.")
+                    print(f"[CoinDCX] Found {spot_filtered_count} Spot executions (up to {target_date}).")
             else:
                 print(f"[CoinDCX] Spot trades response is not a list: {trades}")
         else:
@@ -181,7 +186,7 @@ def fetch_coindcx_trades(api_key, api_secret, target_date):
                     if not ts:
                         continue
                     trade_dt = datetime.fromtimestamp(ts / 1000.0)
-                    if trade_dt.date() == target_date:
+                    if trade_dt <= cutoff_dt:
                         symbol = t.get("pair") or t.get("symbol") or ""
                         is_usdt = symbol.endswith("_USDT") or symbol.endswith("USDT")
                         rate = usdt_inr_rate if is_usdt else 1.0
@@ -197,7 +202,7 @@ def fetch_coindcx_trades(api_key, api_secret, target_date):
                         })
                         futures_filtered_count += 1
                 if futures_filtered_count > 0:
-                    print(f"[CoinDCX] Found {futures_filtered_count} Futures trades matching date {target_date}.")
+                    print(f"[CoinDCX] Found {futures_filtered_count} Futures executions (up to {target_date}).")
             else:
                 print(f"[CoinDCX] Futures trades response is not a list: {trades}")
         else:
@@ -205,7 +210,7 @@ def fetch_coindcx_trades(api_key, api_secret, target_date):
     except Exception as e:
         print(f"[CoinDCX] Futures fetch failed: {e}")
         
-    print(f"[CoinDCX] Total trades found: {len(filtered)} for {target_date}.")
+    print(f"[CoinDCX] Total executions collected: {len(filtered)} (up to {target_date}).")
     return filtered
 
 # --- Fyers API Integration ---
@@ -418,6 +423,7 @@ def get_fyers_token(app_id, secret_id):
     # Generate the login authorization URL
     auth_url = f"https://api-t1.fyers.in/api/v3/generate-authcode?client_id={app_id}&redirect_uri={redirect_uri}&response_type=code&state=tradejournal"
     print(f"Please log in and authorize the app using the link below:\n\n{auth_url}\n")
+    print("--> Press ENTER in this console to skip Fyers login and check other sources <--\n")
     print(f"[Fyers] Starting temporary redirect handler on port {port}...")
     
     server = HTTPServer(('127.0.0.1', port), TokenReceiverHandler)
@@ -425,14 +431,47 @@ def get_fyers_token(app_id, secret_id):
     server.secret_id = secret_id
     server.redirect_uri = redirect_uri
     server.auth_completed = False
+    server.timeout = 0.25
     
-    # Wait for the redirect request
-    while not server.auth_completed:
+    skipped_event = threading.Event()
+
+    def listen_for_enter():
+        try:
+            sys.stdin.readline()
+            skipped_event.set()
+        except Exception:
+            pass
+
+    input_thread = threading.Thread(target=listen_for_enter, daemon=True)
+    input_thread.start()
+
+    # Wait for the redirect request or user pressing Enter to skip
+    while not server.auth_completed and not skipped_event.is_set():
         server.handle_request()
+        if server.auth_completed or skipped_event.is_set():
+            break
+
+        if sys.platform == "win32":
+            if msvcrt.kbhit():
+                user_pressed_enter = False
+                while msvcrt.kbhit():
+                    ch = msvcrt.getch()
+                    if ch in (b'\x00', b'\xe0'):
+                        if msvcrt.kbhit():
+                            msvcrt.getch()
+                    if ch in (b'\r', b'\n'):
+                        user_pressed_enter = True
+                if user_pressed_enter:
+                    skipped_event.set()
+                    break
         
     server.server_close()
     print("[Fyers] Temporary redirect handler closed.")
     
+    if skipped_event.is_set():
+        print("[Fyers] Fyers login skipped by user.")
+        return None
+
     # Read the saved token
     if os.path.exists(token_file):
         with open(token_file, "r") as f:
@@ -545,7 +584,8 @@ def fetch_fyers_trades(app_id, secret_id, target_date):
                 except Exception:
                     trade_dt = datetime.combine(date.today(), datetime.min.time())
             
-            if trade_dt.date() == target_date:
+            cutoff_dt = datetime.combine(target_date, datetime.max.time())
+            if trade_dt <= cutoff_dt:
                 # Group by orderNumber if present, fallback to tradeNumber, symbol+time, etc.
                 order_num = t.get("orderNumber") or t.get("tradeNumber") or f"unknown_{t.get('symbol')}_{trade_time_str}"
                 
@@ -592,7 +632,7 @@ def fetch_fyers_trades(app_id, secret_id, target_date):
                 "fee": charges,
                 "source": "Fyers"
             })
-        print(f"[Fyers] Found {len(filtered)} trades (grouped by order) for {target_date}.")
+        print(f"[Fyers] Found {len(filtered)} trades (grouped by order, up to {target_date}).")
         return filtered
     except Exception as e:
         print(f"[Fyers] Request failed: {e}")
@@ -729,9 +769,79 @@ def merge_partial_exits(trades):
             })
     return merged
 
-def match_executions(executions):
+def get_carry_over_position(past_executions):
+    """
+    Finds if there is any open position carried over from past executions into target_date.
+    Walks backwards from the latest prior date.
+    Stops as soon as cumulative delta balances to 0, OR when a flat day is reached.
+    """
+    if not past_executions:
+        return None
+        
+    past_dates = sorted(set(e['time'].date() for e in past_executions))
+    daily_delta = {}
+    for d in past_dates:
+        d_ex = [e for e in past_executions if e['time'].date() == d]
+        b_qty = sum(e['qty'] for e in d_ex if e['side'] == 'BUY')
+        s_qty = sum(e['qty'] for e in d_ex if e['side'] == 'SELL')
+        daily_delta[d] = b_qty - s_qty
+        
+    cum_delta = 0.0
+    relevant_dates = []
+    for d in reversed(past_dates):
+        delta = daily_delta[d]
+        cum_delta += delta
+        relevant_dates.append(d)
+        if abs(cum_delta) < 1e-5:
+            # Net position entering target_date is completely balanced (flat)!
+            return None
+        if abs(delta) < 1e-5:
+            # If this day was completely flat (delta == 0), the open position could not have come from earlier
+            break
+            
+    if abs(cum_delta) < 1e-5:
+        return None
+        
+    relevant_dates_set = set(relevant_dates)
+    anchor_ex = [e for e in past_executions if e['time'].date() in relevant_dates_set]
+    anchor_merged = preprocess_executions(anchor_ex)
+    sorted_anchor = sorted(anchor_merged, key=lambda x: x["time"])
+    
+    active_entries = []
+    active_side = None
+    for ex in sorted_anchor:
+        qty, price, side = ex["qty"], ex["price"], ex["side"]
+        if active_side is None:
+            active_side = side
+            active_entries.append(dict(ex))
+        elif active_side == side:
+            active_entries.append(dict(ex))
+        else:
+            rem = qty
+            while rem > 1e-6 and active_entries:
+                ent = active_entries[0]
+                m_qty = min(rem, ent["qty"])
+                ent["qty"] -= m_qty
+                rem -= m_qty
+                if ent["qty"] <= 1e-6:
+                    active_entries.pop(0)
+            if not active_entries:
+                active_side = None
+            if rem > 1e-6:
+                active_side = side
+                active_entries.append({**ex, "qty": rem})
+                
+    if active_entries and active_side:
+        return {
+            "active_entries": active_entries,
+            "active_side": active_side
+        }
+    return None
+
+def match_executions(executions, carry_in=None):
     """
     Match chronological raw buy/sell executions for a symbol into structured trades.
+    If carry_in is provided, initializes the position matching with the carried-over entries.
     If there are multiple partial exits at different times, they are split into separate rows.
     """
     # Preprocess to merge simultaneous identical executions
@@ -743,6 +853,11 @@ def match_executions(executions):
     trades = []
     active_entries = [] # List of {"qty": qty, "price": price, "time": time, "fee": fee, "source": source}
     active_side = None
+    
+    # Initialize with carried-over position if present
+    if carry_in and carry_in.get("active_entries"):
+        active_entries = [dict(e) for e in carry_in["active_entries"]]
+        active_side = carry_in.get("active_side")
     
     for ex in sorted_ex:
         qty = ex["qty"]
@@ -870,10 +985,10 @@ def main():
     all_executions.extend(fetch_fyers_trades(fyers_app_id, fyers_secret_id, target_date))
     
     if not all_executions:
-        print(f"\nNo trades found for {target_date} on either Fyers or CoinDCX.")
+        print(f"\nNo trades found up to {target_date} on either Fyers or CoinDCX.")
         return
 
-    # 3. Group and Match Executions by Ticker
+    # 3. Group and Match Executions by Ticker for Target Date
     executions_by_ticker = {}
     for ex in all_executions:
         ticker = ex["symbol"]
@@ -883,11 +998,35 @@ def main():
         
     compiled_trades = []
     for ticker, ex_list in executions_by_ticker.items():
-        matched = match_executions(ex_list)
+        past_ex = [e for e in ex_list if e['time'].date() < target_date]
+        today_ex = [e for e in ex_list if e['time'].date() == target_date]
+        
+        carry_over = get_carry_over_position(past_ex)
+        if carry_over:
+            c_qty = sum(e['qty'] for e in carry_over['active_entries'])
+            print(f"[{ticker}] Detected open position carried from previous session: {carry_over['active_side']} {c_qty:.4f}")
+        else:
+            print(f"[{ticker}] Starting session completely FLAT (0.0). No overnight position carried over.")
+            
+        matched = match_executions(today_ex, carry_in=carry_over)
         compiled_trades.extend(matched)
         
     # Sort matched trades by entry time
     compiled_trades = sorted(compiled_trades, key=lambda x: x["entry_time"])
+
+    # Separate target date trades and earlier trades that closed on target date
+    target_trades = [t for t in compiled_trades if t["entry_time"].date() == target_date]
+    overnight_closed = [
+        t for t in compiled_trades 
+        if t["entry_time"].date() < target_date and (
+            (isinstance(t["exit_time_1"], datetime) and t["exit_time_1"].date() == target_date) or
+            (isinstance(t["exit_time_2"], datetime) and t["exit_time_2"].date() == target_date)
+        )
+    ]
+
+    if not target_trades and not overnight_closed:
+        print(f"\nNo trades entered or closed on {target_date}.")
+        return
 
     # 4. Output to CSV
     csv_file = "trade_journal.csv"
@@ -911,18 +1050,93 @@ def main():
                     if not row or len(row) < 1:
                         continue
                     row_date = row[0]
+                    ticker = row[2] if len(row) > 2 else ""
+                    time_str = row[3] if len(row) > 3 else ""
+                    notes = row[13:] if len(row) > 13 else []
+                    existing_manual_notes[(row_date, ticker, time_str)] = notes
+                    existing_manual_notes[(ticker, time_str)] = notes
+                    
+                    # Remove any corrupted rows from earlier runs where row_date == 2026-09-30 and exit is today's 18:17:42
+                    if row_date == "2026-09-30" and ((len(row) > 4 and row[4] == "18:17:42") or (len(row) > 5 and row[5] == "18:17:42")):
+                        continue
                     if row_date != target_date_str:
                         existing_other_rows.append(row)
-                    else:
-                        ticker = row[2] if len(row) > 2 else ""
-                        time_str = row[3] if len(row) > 3 else ""
-                        notes = row[13:] if len(row) > 13 else []
-                        existing_manual_notes[(ticker, time_str)] = notes
         except Exception as e:
             print(f"[CSV Warning] Could not read existing '{csv_file}': {e}")
 
+    # Normalize trade indexes for existing rows
+    idx_counter = {}
+    normalized_other_rows = []
+    for r in existing_other_rows:
+        d = r[0]
+        idx_counter[d] = idx_counter.get(d, 0) + 1
+        r[1] = idx_counter[d]
+        normalized_other_rows.append(r)
+    existing_other_rows = normalized_other_rows
+
+    # Update existing_other_rows if any overnight closed trade is present
+    overnight_map = {
+        (t["entry_time"].strftime("%Y-%m-%d"), t["ticker"], t["entry_time"].strftime("%H:%M:%S")): t
+        for t in overnight_closed
+    }
+
+    updated_overnight_keys = set()
+    for r in existing_other_rows:
+        key = (r[0], r[2], r[3])
+        if key in overnight_map:
+            t = overnight_map[key]
+            updated_overnight_keys.add(key)
+            exit_1_str = t["exit_time_1"].strftime("%H:%M:%S") if isinstance(t["exit_time_1"], datetime) else str(t["exit_time_1"])
+            exit_2_str = t["exit_time_2"].strftime("%H:%M:%S") if isinstance(t["exit_time_2"], datetime) else str(t["exit_time_2"])
+            pl = f"{t['pl']:.2f}" if isinstance(t["pl"], float) else str(t["pl"])
+            if isinstance(t["pl"], (int, float)) and isinstance(t["fee"], (int, float)):
+                pl_after = f"{(t['pl'] - t['fee']):.2f}"
+            else:
+                pl_after = ""
+            pl_1 = f"{t['pl_1']:.2f}" if isinstance(t["pl_1"], float) else str(t["pl_1"])
+            pl_2 = f"{t['pl_2']:.2f}" if isinstance(t["pl_2"], float) else str(t["pl_2"])
+            fee = f"{t['fee']:.4f}" if isinstance(t["fee"], float) else str(t["fee"])
+            
+            while len(r) < 13:
+                r.append("")
+            r[4] = exit_1_str
+            r[5] = exit_2_str
+            r[6] = t["side"]
+            r[8] = pl_after
+            r[9] = pl
+            r[10] = pl_1
+            r[11] = pl_2
+            r[12] = fee
+
+    # If an overnight closed trade wasn't already in CSV, add it under its entry date
+    for key, t in overnight_map.items():
+        if key not in updated_overnight_keys:
+            entry_d_str, t_sym, entry_t_str = key
+            exit_1_str = t["exit_time_1"].strftime("%H:%M:%S") if isinstance(t["exit_time_1"], datetime) else str(t["exit_time_1"])
+            exit_2_str = t["exit_time_2"].strftime("%H:%M:%S") if isinstance(t["exit_time_2"], datetime) else str(t["exit_time_2"])
+            pl = f"{t['pl']:.2f}" if isinstance(t["pl"], float) else str(t["pl"])
+            if isinstance(t["pl"], (int, float)) and isinstance(t["fee"], (int, float)):
+                pl_after = f"{(t['pl'] - t['fee']):.2f}"
+            else:
+                pl_after = ""
+            pl_1 = f"{t['pl_1']:.2f}" if isinstance(t["pl_1"], float) else str(t["pl_1"])
+            pl_2 = f"{t['pl_2']:.2f}" if isinstance(t["pl_2"], float) else str(t["pl_2"])
+            fee = f"{t['fee']:.4f}" if isinstance(t["fee"], float) else str(t["fee"])
+            
+            saved_notes = existing_manual_notes.get(key) or existing_manual_notes.get((t_sym, entry_t_str), [])
+            while len(saved_notes) < 8:
+                saved_notes.append("")
+            
+            existing_other_rows.append([
+                entry_d_str, 1, t_sym, entry_t_str, exit_1_str, exit_2_str,
+                t["side"], "", pl_after, pl, pl_1, pl_2, fee,
+                saved_notes[0], saved_notes[1], saved_notes[2], saved_notes[3],
+                saved_notes[4], saved_notes[5], saved_notes[6], saved_notes[7]
+            ])
+
+    # Build target rows
     new_target_rows = []
-    for i, t in enumerate(compiled_trades, start=1):
+    for i, t in enumerate(target_trades, start=1):
         trade_idx = i
         entry_time_str = t["entry_time"].strftime("%H:%M:%S")
         exit_1_str = t["exit_time_1"].strftime("%H:%M:%S") if isinstance(t["exit_time_1"], datetime) else str(t["exit_time_1"])
@@ -938,16 +1152,10 @@ def main():
         pl_2 = f"{t['pl_2']:.2f}" if isinstance(t["pl_2"], float) else str(t["pl_2"])
         fee = f"{t['fee']:.4f}" if isinstance(t["fee"], float) else str(t["fee"])
         
-        saved_notes = existing_manual_notes.get((t["ticker"], entry_time_str), [])
-        trend = saved_notes[0] if len(saved_notes) > 0 else ""
-        liquidity = saved_notes[1] if len(saved_notes) > 1 else ""
-        first_candle = saved_notes[2] if len(saved_notes) > 2 else ""
-        setup_exp = saved_notes[3] if len(saved_notes) > 3 else ""
-        is_works = saved_notes[4] if len(saved_notes) > 4 else ""
-        can_improved = saved_notes[5] if len(saved_notes) > 5 else ""
-        learning = saved_notes[6] if len(saved_notes) > 6 else ""
-        num_fail = saved_notes[7] if len(saved_notes) > 7 else ""
-        
+        saved_notes = existing_manual_notes.get((target_date_str, t["ticker"], entry_time_str)) or existing_manual_notes.get((t["ticker"], entry_time_str), [])
+        while len(saved_notes) < 8:
+            saved_notes.append("")
+            
         row = [
             target_date_str,                  # Date
             trade_idx,                        # Trade Index
@@ -962,14 +1170,14 @@ def main():
             pl_1,                             # P/L 1
             pl_2,                             # P/L 2
             fee,                              # Brokrage
-            trend,                            # Trend
-            liquidity,                        # Liqudity type
-            first_candle,                     # First candle type
-            setup_exp,                        # Setup explanation
-            is_works,                         # Is trade works
-            can_improved,                     # Can this be improved
-            learning,                         # Learning
-            num_fail                          # Number of fail...
+            saved_notes[0],                   # Trend
+            saved_notes[1],                   # Liqudity type
+            saved_notes[2],                   # First candle type
+            saved_notes[3],                   # Setup explanation
+            saved_notes[4],                   # Is trade works
+            saved_notes[5],                   # Can this be improved
+            saved_notes[6],                   # Learning
+            saved_notes[7]                    # Number of fail...
         ]
         new_target_rows.append(row)
 
@@ -986,7 +1194,7 @@ def main():
     all_final_rows = existing_other_rows + new_target_rows
     all_final_rows.sort(key=parse_sort_key)
 
-    print(f"\nWriting {len(compiled_trades)} trades for {target_date_str} to '{csv_file}' (preserving previous dates)...")
+    print(f"\nWriting {len(target_trades)} trades for {target_date_str} to '{csv_file}' (preserving previous dates)...")
     
     try:
         with open(csv_file, "w", newline="", encoding="utf-8") as f:
@@ -999,13 +1207,13 @@ def main():
         print(f"\n[ERROR] Permission Denied: Could not write to '{csv_file}'. Please make sure it is closed and not open in Excel, then run again.")
         return
 
-    # Calculate and Print terminal summaries
-    fyers_gross = sum(t["pl"] for t in compiled_trades if "Fyers" in t.get("source", "") and isinstance(t["pl"], (int, float)))
-    fyers_fee = sum(t["fee"] for t in compiled_trades if "Fyers" in t.get("source", "") and isinstance(t["fee"], (int, float)))
+    # Calculate and Print terminal summaries for target date
+    fyers_gross = sum(t["pl"] for t in target_trades if "Fyers" in t.get("source", "") and isinstance(t["pl"], (int, float)))
+    fyers_fee = sum(t["fee"] for t in target_trades if "Fyers" in t.get("source", "") and isinstance(t["fee"], (int, float)))
     fyers_net = fyers_gross - fyers_fee
 
-    coindcx_gross = sum(t["pl"] for t in compiled_trades if "CoinDCX" in t.get("source", "") and isinstance(t["pl"], (int, float)))
-    coindcx_fee = sum(t["fee"] for t in compiled_trades if "CoinDCX" in t.get("source", "") and isinstance(t["fee"], (int, float)))
+    coindcx_gross = sum(t["pl"] for t in target_trades if "CoinDCX" in t.get("source", "") and isinstance(t["pl"], (int, float)))
+    coindcx_fee = sum(t["fee"] for t in target_trades if "CoinDCX" in t.get("source", "") and isinstance(t["fee"], (int, float)))
     coindcx_net = coindcx_gross - coindcx_fee
 
     combined_gross = fyers_gross + coindcx_gross
@@ -1026,7 +1234,19 @@ def main():
     print(f"Combined Gross P/L: Rs. {combined_gross:,.2f}")
     print(f"Combined Charges  : Rs. {combined_fee:,.2f}")
     print(f"Combined Net P/L  : Rs. {combined_net:,.2f}")
-    print("==================================================\n")
+    print("==================================================")
+
+    if overnight_closed:
+        print("\n--------------------------------------------------")
+        print(f"Overnight Trades Closed on {target_date_str}:")
+        for t in overnight_closed:
+            entry_d = t["entry_time"].strftime("%Y-%m-%d %H:%M:%S")
+            ex_time_1_str = t["exit_time_1"].strftime("%H:%M:%S") if isinstance(t["exit_time_1"], datetime) else str(t["exit_time_1"])
+            ex_time_2_str = t["exit_time_2"].strftime("%H:%M:%S") if isinstance(t["exit_time_2"], datetime) else str(t["exit_time_2"])
+            exits_disp = f"Exit 1: {ex_time_1_str}" + (f", Exit 2: {ex_time_2_str}" if ex_time_2_str else "")
+            print(f"  - {t['ticker']} (Side: {t['side']}) | Entered: {entry_d} | {exits_disp}")
+            print(f"    Total P/L: Rs. {t['pl']:.2f} | Brokerage: Rs. {t['fee']:.4f} (Updated under {t['entry_time'].strftime('%Y-%m-%d')} in CSV)")
+        print("--------------------------------------------------\n")
 
 if __name__ == "__main__":
     main()
